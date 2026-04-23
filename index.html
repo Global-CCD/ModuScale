@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mic Input LFO Scaler</title>
+    <style>
+        :root {
+            --bg: #121212;
+            --surface: #1e1e1e;
+            --primary: #bb86fc;
+            --secondary: #03dac6;
+            --text: #e0e0e0;
+            --text-dim: #a0a0a0;
+            --border: #333;
+        }
+        * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { background-color: var(--bg); color: var(--text); padding: 20px; margin: 0; }
+        h1, h3 { margin-top: 0; color: var(--primary); }
+        
+        .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 20px; }
+        .control-group { background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 20px; }
+        
+        button { background: var(--primary); color: #000; border: none; padding: 10px 20px; font-weight: bold; border-radius: 4px; cursor: pointer; transition: 0.2s; }
+        button:hover { opacity: 0.8; }
+        button:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
+        .btn-stop { background: #cf6679; }
+
+        input, select { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 5px 10px; border-radius: 4px; }
+        
+        .grid-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; }
+        .setting-item { display: flex; flex-direction: column; gap: 5px; }
+        .setting-item label { font-size: 0.85rem; color: var(--text-dim); }
+
+        #tracksContainer { display: flex; flex-direction: column; gap: 15px; }
+        .track-card { background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); display: grid; grid-template-columns: 1fr 2fr 1fr 1fr 1fr; gap: 15px; align-items: center; }
+        .track-header { font-weight: bold; font-size: 1.1rem; color: var(--secondary); }
+        
+        /* Math Logic Table Styling */
+        .info-table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.85rem; background: var(--surface); }
+        .info-table th, .info-table td { border: 1px solid var(--border); padding: 8px; text-align: left; }
+        .info-table th { color: var(--primary); }
+
+        /* LFO Visualizer */
+        .visualizer-container { width: 100%; height: 20px; background: var(--bg); border-radius: 4px; overflow: hidden; position: relative; border: 1px solid var(--border); }
+        .visualizer-bar { height: 100%; background: var(--secondary); width: 0%; transform-origin: left; }
+        .math-badge { background: #333; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem; color: #fff;}
+        
+        @media (max-width: 900px) {
+            .track-card { grid-template-columns: 1fr 1fr; }
+            .track-header { grid-column: span 2; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div>
+            <h1>LFO Mic Scaler</h1>
+            <p style="color: #cf6679; font-weight: bold;">⚠ Use headphones to prevent audio feedback loops!</p>
+        </div>
+        <div style="display: flex; gap: 10px;">
+            <button id="btnStart">Enable Microphone</button>
+            <button id="btnStop" class="btn-stop" disabled>Stop Audio</button>
+        </div>
+    </div>
+
+    <div class="control-group grid-settings">
+        <div class="setting-item">
+            <label>Global BPM</label>
+            <input type="number" id="globalBpm" value="120" min="10" max="300">
+        </div>
+        <div class="setting-item">
+            <label>Number of Tracks (1-5)</label>
+            <input type="number" id="numTracks" value="2" min="1" max="5">
+        </div>
+    </div>
+
+    <div id="tracksContainer">
+        <!-- Tracks will be dynamically injected here -->
+    </div>
+
+    <table class="info-table">
+        <tr>
+            <th>Feature</th><th>Stage</th><th>Primary Use</th><th>Math Logic</th>
+        </tr>
+        <tr><td>Gain</td><td>Pre-Processing</td><td>Signal strength/Saturation</td><td>Additive/Subtractive (dB)</td></tr>
+        <tr><td>Volume</td><td>Post-Processing</td><td>Mixing and Balancing</td><td>Additive/Subtractive (dB)</td></tr>
+        <tr><td>Scale</td><td>Data/Control</td><td>Shrinking/Expanding ranges</td><td>Multiplicative (x)</td></tr>
+        <tr><td>Offset</td><td>Data/Control</td><td>Shifting the baseline</td><td>Constant Addition (+)</td></tr>
+    </table>
+
+    <script>
+        let audioCtx;
+        let micStream;
+        let micSource;
+        let masterGain;
+        const tracks = [];
+        let isRunning = false;
+
+        const btnStart = document.getElementById('btnStart');
+        const btnStop = document.getElementById('btnStop');
+        const inputBpm = document.getElementById('globalBpm');
+        const inputNumTracks = document.getElementById('numTracks');
+        const tracksContainer = document.getElementById('tracksContainer');
+
+        class Track {
+            constructor(id) {
+                this.id = id;
+                this.defaultQN = id === 1 ? 6 : (id === 2 ? 4 : id * 2);
+
+                // Setup UI
+                this.createUI();
+
+                if (audioCtx) this.initAudio();
+            }
+
+            createUI() {
+                this.el = document.createElement('div');
+                this.el.className = 'track-card';
+                this.el.innerHTML = `
+                    <div class="track-header">Track ${this.id}</div>
+                    
+                    <div class="setting-item">
+                        <label>LFO Waveform</label>
+                        <select class="ctrl-wave">
+                            <option value="sine">Sine</option>
+                            <option value="square">Square</option>
+                            <option value="triangle">Triangle</option>
+                            <option value="sawL">Saw L (Rising)</option>
+                            <option value="sawR">Saw R (Falling)</option>
+                        </select>
+                    </div>
+
+                    <div class="setting-item">
+                        <label>Speed (QN) <span class="math-badge">Freq = BPM/(60*QN)</span></label>
+                        <input type="number" class="ctrl-qn" value="${this.defaultQN}" step="0.5" min="0.5">
+                    </div>
+
+                    <div class="setting-item">
+                        <label>LFO Amount % <span class="math-badge">Scale (x)</span></label>
+                        <input type="number" class="ctrl-amt" value="100" min="0" max="100">
+                    </div>
+
+                    <div class="setting-item">
+                        <label>Current Scale Multiplier</label>
+                        <div class="visualizer-container">
+                            <div class="visualizer-bar" id="vis-bar-${this.id}"></div>
+                        </div>
+                    </div>
+                `;
+                tracksContainer.appendChild(this.el);
+
+                // Bind UI Events
+                this.ui = {
+                    wave: this.el.querySelector('.ctrl-wave'),
+                    qn: this.el.querySelector('.ctrl-qn'),
+                    amt: this.el.querySelector('.ctrl-amt'),
+                    visBar: this.el.querySelector(`#vis-bar-${this.id}`)
+                };
+
+                this.ui.wave.addEventListener('change', () => this.updateMath());
+                this.ui.qn.addEventListener('input', () => this.updateMath());
+                this.ui.amt.addEventListener('input', () => this.updateMath());
+            }
+
+            initAudio() {
+                // 1. The Core Multiplier Node: applies Multiplicative (x) scaling to the Audio
+                this.multiplierNode = audioCtx.createGain();
+                this.multiplierNode.gain.value = 0; // Baseline is 0, completely overridden by LFO control data
+
+                // 2. Control Data Generation (LFO outputs -1.0 to 1.0)
+                this.lfo = audioCtx.createOscillator();
+                
+                // 3. Scale (x) Node: Shrinks/Expands the LFO range
+                this.scaleNode = audioCtx.createGain();
+                
+                // 4. Offset (+) Node: Shifts the baseline so we are scaling from 0 to 1 instead of -1 to 1
+                this.offsetNode = audioCtx.createConstantSource();
+                this.offsetNode.offset.value = 0.5; // Shift baseline +0.5
+
+                // 5. Analyser for the Visualizer (Reads the Control Data, not the audio)
+                this.analyser = audioCtx.createAnalyser();
+                this.analyser.fftSize = 32;
+                this.controlDataArray = new Float32Array(this.analyser.frequencyBinCount);
+
+                // ROUTING
+                // LFO -> Scale(x) -> Multiplier Gain
+                this.lfo.connect(this.scaleNode);
+                this.scaleNode.connect(this.multiplierNode.gain);
+                
+                // Offset(+) -> Multiplier Gain
+                this.offsetNode.connect(this.multiplierNode.gain);
+
+                // Route Control Signal sum to Analyser for UI visualization
+                this.scaleNode.connect(this.analyser);
+                this.offsetNode.connect(this.analyser);
+
+                // Connect Mic to Multiplier, Multiplier to Master Out
+                if (micSource) micSource.connect(this.multiplierNode);
+                this.multiplierNode.connect(masterGain);
+
+                this.lfo.start();
+                this.offsetNode.start();
+
+                this.updateMath();
+            }
+
+            updateMath() {
+                if (!audioCtx) return;
+
+                const bpm = parseFloat(inputBpm.value) || 120;
+                const qn = parseFloat(this.ui.qn.value) || 4;
+                const amtPct = parseFloat(this.ui.amt.value) || 0;
+                const wave = this.ui.wave.value;
+
+                // Frequency = BPM / (60 * QN)
+                const freq = bpm / (60 * qn);
+                this.lfo.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.1);
+
+                // Calculate Scale (x). 
+                // A 100% Amount means scaling from 0.0 to 1.0. 
+                // Since LFO is -1 to 1, we need to multiply it by 0.5 (Scale) and add 0.5 (Offset).
+                let mathScale = (amtPct / 100) * 0.5;
+
+                // Handle Waveforms
+                if (wave === 'sawL') {
+                    // WebAudio default 'sawtooth' is falling (Saw R). 
+                    // To make a rising (Saw L) sawtooth, we mathematically invert the Scale (x) factor.
+                    this.lfo.type = 'sawtooth';
+                    mathScale = -mathScale;
+                } else if (wave === 'sawR') {
+                    this.lfo.type = 'sawtooth';
+                } else {
+                    this.lfo.type = wave;
+                }
+
+                this.scaleNode.gain.setTargetAtTime(mathScale, audioCtx.currentTime, 0.1);
+            }
+
+            updateVisualizer() {
+                if (!this.analyser) return;
+                this.analyser.getFloatTimeDomainData(this.controlDataArray);
+                // Control signal varies slowly, taking the first sample is sufficient
+                let val = this.controlDataArray[0]; 
+                
+                // Clamp visualizer between 0% and 100%
+                let pct = Math.max(0, Math.min(1, val)) * 100;
+                this.ui.visBar.style.width = `${pct}%`;
+            }
+
+            destroy() {
+                this.el.remove();
+                if (this.lfo) {
+                    this.lfo.stop();
+                    this.offsetNode.stop();
+                    this.lfo.disconnect();
+                    this.scaleNode.disconnect();
+                    this.offsetNode.disconnect();
+                    this.multiplierNode.disconnect();
+                }
+            }
+        }
+
+        function renderTracks() {
+            const count = parseInt(inputNumTracks.value) || 2;
+            
+            // Add new tracks
+            while (tracks.length < count) {
+                tracks.push(new Track(tracks.length + 1));
+            }
+            
+            // Remove excess tracks
+            while (tracks.length > count) {
+                const trk = tracks.pop();
+                trk.destroy();
+            }
+
+            // Update master gain to prevent clipping when summing multiple tracks
+            if (masterGain) {
+                masterGain.gain.value = 1 / count; 
+            }
+        }
+
+        // --- Audio Context & Mic Initialization ---
+        async function startAudio() {
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
+                
+                audioCtx = new AudioContext();
+                micSource = audioCtx.createMediaStreamSource(micStream);
+                
+                masterGain = audioCtx.createGain();
+                masterGain.connect(audioCtx.destination);
+                masterGain.gain.value = 1 / tracks.length;
+
+                // Initialize audio graph for already rendered UI tracks
+                tracks.forEach(trk => trk.initAudio());
+
+                isRunning = true;
+                btnStart.disabled = true;
+                btnStop.disabled = false;
+                
+                animationLoop();
+            } catch (err) {
+                alert("Error accessing microphone: " + err.message);
+            }
+        }
+
+        function stopAudio() {
+            if (audioCtx) {
+                audioCtx.close();
+                audioCtx = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+            }
+            isRunning = false;
+            btnStart.disabled = false;
+            btnStop.disabled = true;
+        }
+
+        function animationLoop() {
+            if (!isRunning) return;
+            tracks.forEach(trk => trk.updateVisualizer());
+            requestAnimationFrame(animationLoop);
+        }
+
+        // Events
+        btnStart.addEventListener('click', startAudio);
+        btnStop.addEventListener('click', stopAudio);
+        inputNumTracks.addEventListener('input', renderTracks);
+        inputBpm.addEventListener('input', () => tracks.forEach(trk => trk.updateMath()));
+
+        // Initial render
+        renderTracks();
+    </script>
+</body>
+</html>
